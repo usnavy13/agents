@@ -36,10 +36,16 @@ import type * as t from '@langchain/openai';
 import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
 import {
+  isReasoningModel,
+  _convertMessagesToOpenAIParams,
+  _convertMessagesToOpenAIResponsesParams,
+  _convertOpenAIResponsesDeltaToBaseMessageChunk,
+  _convertOpenAIResponsesMessageToBaseMessage,
+} from './utils';
+import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
-import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -102,9 +108,15 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
   convertReasoningDetailsToContent?: boolean;
+  promptCacheExplicit?: boolean;
+  safety_identifier?: string;
+  nativeProgrammaticToolCalling?: boolean;
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
+  promptCacheExplicit?: boolean;
+  safety_identifier?: string;
+  nativeProgrammaticToolCalling?: boolean;
 };
 type ReasoningCallOptions = {
   reasoning?: OpenAIClient.Reasoning;
@@ -153,6 +165,592 @@ type OpenAIChatCompletionRetry = (
 ) => Promise<
   AsyncIterable<OpenAIChatCompletionStreamItem> | OpenAIChatCompletion
 >;
+type OpenAIManagedRequestFields = {
+  promptCacheExplicit?: boolean;
+  safetyIdentifier?: string;
+  nativeProgrammaticToolCalling?: boolean;
+};
+type OpenAIManagedRequestParams = {
+  prompt_cache_options?: {
+    mode: 'explicit';
+    ttl: '30m';
+  };
+  safety_identifier?: string;
+};
+type ResponsesTool = NonNullable<
+  OpenAIClient.Responses.ResponseCreateParams['tools']
+>[number];
+type ResponsesRequest =
+  | OpenAIClient.Responses.ResponseCreateParamsStreaming
+  | OpenAIClient.Responses.ResponseCreateParamsNonStreaming;
+type ResponsesResult =
+  | AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>
+  | OpenAIClient.Responses.Response;
+type ToolWithCallerMetadata = BindToolsInput & {
+  metadata?: {
+    allowed_callers?: Array<'direct' | 'code_execution'>;
+  };
+};
+type CacheableChatPart = {
+  type: 'text' | 'image_url' | 'input_audio' | 'file' | 'refusal';
+  prompt_cache_breakpoint?: { mode: 'explicit' };
+  [key: string]: unknown;
+};
+type CacheableResponsePart = (
+  | OpenAIClient.Responses.ResponseInputText
+  | OpenAIClient.Responses.ResponseInputImage
+  | OpenAIClient.Responses.ResponseInputFile
+) & {
+  prompt_cache_breakpoint?: { mode: 'explicit' };
+};
+type ResponsesUsageWithCacheWrite = OpenAIClient.Responses.ResponseUsage & {
+  input_tokens_details?: OpenAIClient.Responses.ResponseUsage['input_tokens_details'] & {
+    cache_write_tokens?: number;
+  };
+};
+const CACHE_WRITE_METADATA_KEY = '__librechat_cache_write_tokens';
+
+function applyManagedRequestParams<T extends object>(
+  params: T,
+  fields: OpenAIManagedRequestFields
+): T & OpenAIManagedRequestParams {
+  return {
+    ...params,
+    ...(fields.promptCacheExplicit === true && {
+      prompt_cache_options: {
+        mode: 'explicit' as const,
+        ttl: '30m' as const,
+      },
+    }),
+    ...(fields.safetyIdentifier != null && {
+      safety_identifier: fields.safetyIdentifier,
+    }),
+  };
+}
+
+function getNativeResponsesTools(
+  tools: BindToolsInput[],
+  reduced: ResponsesTool[],
+  enabled: boolean
+): ResponsesTool[] {
+  if (enabled !== true) {
+    return reduced;
+  }
+
+  const callerMetadata = new Map<string, ToolWithCallerMetadata['metadata']>();
+  for (const tool of tools) {
+    const candidate = tool as ToolWithCallerMetadata & {
+      name?: string;
+      function?: { name?: string };
+    };
+    const name = candidate.name ?? candidate.function?.name;
+    if (name != null && name !== '') {
+      callerMetadata.set(name, candidate.metadata);
+    }
+  }
+
+  const mapped = reduced.map((tool) => {
+    if (tool.type === 'programmatic_tool_calling') {
+      return tool;
+    }
+    if (tool.type !== 'function') {
+      return tool;
+    }
+
+    const metadata = callerMetadata.get(tool.name);
+    const configured = metadata?.allowed_callers;
+    if (configured?.includes('code_execution') !== true) {
+      return tool;
+    }
+
+    return {
+      ...tool,
+      allowed_callers: [
+        ...(configured.includes('direct') ? (['direct'] as const) : []),
+        'programmatic' as const,
+      ],
+    };
+  });
+
+  if (!mapped.some((tool) => tool.type === 'programmatic_tool_calling')) {
+    mapped.push({ type: 'programmatic_tool_calling' });
+  }
+  return mapped;
+}
+
+function isCacheableChatPart(part: unknown): part is CacheableChatPart {
+  if (typeof part !== 'object' || part == null || !('type' in part)) {
+    return false;
+  }
+  return (
+    part.type === 'text' ||
+    part.type === 'image_url' ||
+    part.type === 'input_audio' ||
+    part.type === 'file' ||
+    part.type === 'refusal'
+  );
+}
+
+function canAddChatBreakpoint(
+  message: OpenAIClient.Chat.Completions.ChatCompletionMessageParam
+): boolean {
+  if (
+    message.role !== 'system' &&
+    message.role !== 'developer' &&
+    message.role !== 'user' &&
+    message.role !== 'assistant' &&
+    message.role !== 'tool'
+  ) {
+    return false;
+  }
+  if (typeof message.content === 'string') {
+    return message.content.length > 0;
+  }
+  return (
+    Array.isArray(message.content) &&
+    message.content.some((part) => isCacheableChatPart(part))
+  );
+}
+
+function addChatBreakpoint(
+  message: OpenAIClient.Chat.Completions.ChatCompletionMessageParam
+): OpenAIClient.Chat.Completions.ChatCompletionMessageParam {
+  if (!canAddChatBreakpoint(message)) {
+    return message;
+  }
+
+  if (typeof message.content === 'string') {
+    return {
+      ...message,
+      content: [
+        {
+          type: 'text',
+          text: message.content,
+          prompt_cache_breakpoint: { mode: 'explicit' },
+        },
+      ],
+    } as unknown as OpenAIClient.Chat.Completions.ChatCompletionMessageParam;
+  }
+  if (!Array.isArray(message.content) || message.content.length === 0) {
+    return message;
+  }
+
+  const content = [...message.content] as unknown as CacheableChatPart[];
+  let index = content.length - 1;
+  while (index >= 0 && !isCacheableChatPart(content[index])) {
+    index--;
+  }
+  if (index < 0) {
+    return message;
+  }
+  content[index] = {
+    ...content[index],
+    prompt_cache_breakpoint: { mode: 'explicit' },
+  };
+  return {
+    ...message,
+    content,
+  } as unknown as OpenAIClient.Chat.Completions.ChatCompletionMessageParam;
+}
+
+function selectCacheBreakpointIndexes(
+  roles: Array<string | undefined>,
+  cacheable: boolean[]
+): number[] {
+  let instructionIndex = -1;
+  let latestUserIndex = -1;
+  for (let index = 0; index < roles.length; index++) {
+    const role = roles[index];
+    if ((role === 'system' || role === 'developer') && cacheable[index]) {
+      instructionIndex = index;
+    }
+    if (role === 'user') {
+      latestUserIndex = index;
+    }
+  }
+
+  const indexes = new Set<number>();
+  if (instructionIndex >= 0) {
+    indexes.add(instructionIndex);
+  }
+  for (let index = latestUserIndex - 1; index >= 0; index--) {
+    if (cacheable[index]) {
+      indexes.add(index);
+      break;
+    }
+  }
+  return [...indexes];
+}
+
+/** @internal */
+export function addChatCacheBreakpoints(
+  messages: OpenAIClient.Chat.Completions.ChatCompletionMessageParam[]
+): OpenAIClient.Chat.Completions.ChatCompletionMessageParam[] {
+  const indexes = new Set(
+    selectCacheBreakpointIndexes(
+      messages.map((message) => message.role),
+      messages.map((message) => canAddChatBreakpoint(message))
+    )
+  );
+  return messages.map((message, index) =>
+    indexes.has(index) ? addChatBreakpoint(message) : message
+  );
+}
+
+function isResponseMessage(
+  item: OpenAIClient.Responses.ResponseInputItem
+): item is OpenAIClient.Responses.ResponseInputItem.Message {
+  return item.type === 'message';
+}
+
+function addResponseBreakpoint(
+  item: OpenAIClient.Responses.ResponseInputItem
+): OpenAIClient.Responses.ResponseInputItem {
+  if (!isResponseMessage(item)) {
+    return item;
+  }
+  if (!Array.isArray(item.content) || item.content.length === 0) {
+    return item;
+  }
+
+  const content = [...item.content];
+  const index = content.length - 1;
+  content[index] = {
+    ...(content[index] as CacheableResponsePart),
+    prompt_cache_breakpoint: { mode: 'explicit' },
+  };
+  return { ...item, content };
+}
+
+/** @internal */
+export function addResponseCacheBreakpoints(
+  input: OpenAIClient.Responses.ResponseCreateParams['input']
+): OpenAIClient.Responses.ResponseCreateParams['input'] {
+  if (!Array.isArray(input)) {
+    return input;
+  }
+  const indexes = new Set(
+    selectCacheBreakpointIndexes(
+      input.map((item) => (isResponseMessage(item) ? item.role : undefined)),
+      input.map(
+        (item) =>
+          isResponseMessage(item) &&
+          Array.isArray(item.content) &&
+          item.content.length > 0
+      )
+    )
+  );
+  return input.map((item, index) =>
+    indexes.has(index) ? addResponseBreakpoint(item) : item
+  );
+}
+
+function addProgrammaticCallerLinkage(
+  input: OpenAIClient.Responses.ResponseCreateParams['input']
+): OpenAIClient.Responses.ResponseCreateParams['input'] {
+  if (!Array.isArray(input)) {
+    return input;
+  }
+
+  const callers = new Map<string, { type: 'program'; caller_id: string }>();
+  for (const item of input) {
+    if (item.type === 'function_call' && item.caller?.type === 'program') {
+      callers.set(item.call_id, item.caller);
+    }
+  }
+
+  return input.map((item) => {
+    if (item.type !== 'function_call_output' || item.caller != null) {
+      return item;
+    }
+    const caller = callers.get(item.call_id);
+    return caller ? { ...item, caller } : item;
+  });
+}
+
+/** @internal */
+export function shouldIncludeEncryptedReasoning(
+  model: string,
+  params: {
+    store?: boolean | null;
+    reasoning?: unknown;
+  }
+): boolean {
+  const reasoningContext = (
+    params.reasoning as
+      | { context?: 'auto' | 'current_turn' | 'all_turns' }
+      | undefined
+  )?.context;
+  return (
+    /^gpt-5\.6(?:-|$)/i.test(model) &&
+    (params.store === false || reasoningContext !== 'current_turn')
+  );
+}
+
+function getCacheWriteTokens(message: BaseMessage): number | undefined {
+  const responseMetadata = message.response_metadata as {
+    usage?: ResponsesUsageWithCacheWrite;
+    metadata?: Record<string, string>;
+  };
+  const reported =
+    responseMetadata.usage?.input_tokens_details.cache_write_tokens;
+  if (reported != null) {
+    return reported;
+  }
+  const serialized = responseMetadata.metadata?.[CACHE_WRITE_METADATA_KEY];
+  if (serialized == null) {
+    return;
+  }
+  const parsed = Number(serialized);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function attachCacheWriteUsage(message: BaseMessage): void {
+  const cacheWriteTokens = getCacheWriteTokens(message);
+  if (
+    cacheWriteTokens == null ||
+    !isAIMessage(message) ||
+    message.usage_metadata == null
+  ) {
+    return;
+  }
+  message.usage_metadata.input_token_details = {
+    ...message.usage_metadata.input_token_details,
+    cache_creation: cacheWriteTokens,
+  };
+  const responseMetadata = message.response_metadata as {
+    metadata?: Record<string, string>;
+  };
+  if (responseMetadata.metadata?.[CACHE_WRITE_METADATA_KEY] == null) {
+    return;
+  }
+  const metadata = { ...responseMetadata.metadata };
+  delete metadata[CACHE_WRITE_METADATA_KEY];
+  message.response_metadata = {
+    ...message.response_metadata,
+    metadata,
+  };
+}
+
+function attachCacheWriteMetadata(
+  response: OpenAIClient.Responses.Response
+): OpenAIClient.Responses.Response {
+  const usage = response.usage as ResponsesUsageWithCacheWrite | undefined;
+  const cacheWriteTokens = usage?.input_tokens_details.cache_write_tokens;
+  if (cacheWriteTokens == null) {
+    return response;
+  }
+  return {
+    ...response,
+    metadata: {
+      ...(response.metadata ?? {}),
+      [CACHE_WRITE_METADATA_KEY]: String(cacheWriteTokens),
+    },
+  };
+}
+
+function isResponsesStream(
+  result: ResponsesResult
+): result is AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent> {
+  return Symbol.asyncIterator in result;
+}
+
+function shouldContinueNativeProgram(
+  response: OpenAIClient.Responses.Response
+): boolean {
+  if (response.status !== 'completed') {
+    return false;
+  }
+  const hasMessage = response.output.some((item) => item.type === 'message');
+  const hasPendingFunctionCall = response.output.some(
+    (item) => item.type === 'function_call'
+  );
+  const hasProgramState = response.output.some(
+    (item) => item.type === 'program' || item.type === 'program_output'
+  );
+  return !hasMessage && !hasPendingFunctionCall && hasProgramState;
+}
+
+function getNativeProgramContinuationRequest(
+  request: OpenAIClient.Responses.ResponseCreateParamsStreaming,
+  response: OpenAIClient.Responses.Response
+): OpenAIClient.Responses.ResponseCreateParamsStreaming;
+function getNativeProgramContinuationRequest(
+  request: OpenAIClient.Responses.ResponseCreateParamsNonStreaming,
+  response: OpenAIClient.Responses.Response
+): OpenAIClient.Responses.ResponseCreateParamsNonStreaming;
+function getNativeProgramContinuationRequest(
+  request: ResponsesRequest,
+  response: OpenAIClient.Responses.Response
+): ResponsesRequest {
+  if (request.store === false) {
+    const input = Array.isArray(request.input) ? request.input : [];
+    return {
+      ...request,
+      input: [
+        ...input,
+        ...(response.output as unknown as OpenAIClient.Responses.ResponseInput),
+      ],
+      previous_response_id: undefined,
+    };
+  }
+  return {
+    ...request,
+    input: [],
+    previous_response_id: response.id,
+  };
+}
+
+function mergeResponsesUsage(
+  responses: OpenAIClient.Responses.Response[]
+): OpenAIClient.Responses.ResponseUsage | undefined {
+  const usages = responses
+    .map((response) => response.usage)
+    .filter(
+      (usage): usage is OpenAIClient.Responses.ResponseUsage => usage != null
+    );
+  const lastUsage = usages.at(-1);
+  if (lastUsage == null) {
+    return;
+  }
+  const cacheWriteTokens = usages.reduce((total, usage) => {
+    const cacheWriteTokens = (
+      usage.input_tokens_details as unknown as Record<string, unknown>
+    ).cache_write_tokens;
+    return (
+      total + (typeof cacheWriteTokens === 'number' ? cacheWriteTokens : 0)
+    );
+  }, 0);
+  return {
+    ...lastUsage,
+    input_tokens: usages.reduce(
+      (total, usage) => total + usage.input_tokens,
+      0
+    ),
+    output_tokens: usages.reduce(
+      (total, usage) => total + usage.output_tokens,
+      0
+    ),
+    total_tokens: usages.reduce(
+      (total, usage) => total + usage.total_tokens,
+      0
+    ),
+    input_tokens_details: {
+      ...lastUsage.input_tokens_details,
+      cached_tokens: usages.reduce(
+        (total, usage) => total + usage.input_tokens_details.cached_tokens,
+        0
+      ),
+      ...(cacheWriteTokens > 0 && { cache_write_tokens: cacheWriteTokens }),
+    },
+    output_tokens_details: {
+      ...lastUsage.output_tokens_details,
+      reasoning_tokens: usages.reduce(
+        (total, usage) => total + usage.output_tokens_details.reasoning_tokens,
+        0
+      ),
+    },
+  } as ResponsesUsageWithCacheWrite;
+}
+
+function mergeNativeProgramResponses(
+  responses: OpenAIClient.Responses.Response[]
+): OpenAIClient.Responses.Response {
+  const finalResponse = responses[responses.length - 1];
+  return {
+    ...finalResponse,
+    output: responses.flatMap((response) => response.output),
+    usage: mergeResponsesUsage(responses),
+  };
+}
+
+type CompleteResponsesRequest = (
+  request: ResponsesRequest,
+  requestOptions?: OpenAICoreRequestOptions
+) => Promise<ResponsesResult>;
+
+type ResponsesTerminalEvent = Extract<
+  OpenAIClient.Responses.ResponseStreamEvent,
+  { type: 'response.completed' | 'response.incomplete' }
+>;
+
+/** @internal */
+export async function completeResponsesWithNativeContinuation(
+  request: ResponsesRequest,
+  requestOptions: OpenAICoreRequestOptions | undefined,
+  enabled: boolean,
+  complete: CompleteResponsesRequest
+): Promise<ResponsesResult> {
+  if (enabled !== true) {
+    return complete(request, requestOptions);
+  }
+
+  if (request.stream === true) {
+    return (async function* (): AsyncGenerator<OpenAIClient.Responses.ResponseStreamEvent> {
+      const responses: OpenAIClient.Responses.Response[] = [];
+      let nextRequest = request;
+      for (let continuation = 0; continuation < 8; continuation++) {
+        const result = await complete(nextRequest, requestOptions);
+        if (!isResponsesStream(result)) {
+          throw new Error('Expected a streaming OpenAI Responses result.');
+        }
+        let terminalEvent: ResponsesTerminalEvent | undefined;
+        for await (const event of result) {
+          if (
+            event.type === 'response.completed' ||
+            event.type === 'response.incomplete'
+          ) {
+            terminalEvent = event;
+            continue;
+          }
+          yield event;
+        }
+        if (terminalEvent == null) {
+          return;
+        }
+        responses.push(terminalEvent.response);
+        if (!shouldContinueNativeProgram(terminalEvent.response)) {
+          yield {
+            ...terminalEvent,
+            response: mergeNativeProgramResponses(responses),
+          };
+          return;
+        }
+        nextRequest = getNativeProgramContinuationRequest(
+          nextRequest,
+          terminalEvent.response
+        );
+      }
+      throw new Error(
+        'Native Programmatic Tool Calling exceeded the continuation limit.'
+      );
+    })();
+  }
+
+  const responses: OpenAIClient.Responses.Response[] = [];
+  let nextRequest = request;
+  for (let continuation = 0; continuation < 8; continuation++) {
+    const result = await complete(nextRequest, requestOptions);
+    if (isResponsesStream(result)) {
+      throw new Error('Expected a non-streaming OpenAI Responses result.');
+    }
+    responses.push(result);
+    if (!shouldContinueNativeProgram(result)) {
+      return mergeNativeProgramResponses(responses);
+    }
+    nextRequest = getNativeProgramContinuationRequest(nextRequest, result);
+  }
+  throw new Error(
+    'Native Programmatic Tool Calling exceeded the continuation limit.'
+  );
+}
+
+function hasResponsesReplayItems(messages: BaseMessage[]): boolean {
+  return messages.some((message) => {
+    const output = (message.response_metadata as { output?: unknown }).output;
+    return Array.isArray(output) && output.length > 0;
+  });
+}
 
 function createUsageMetadata(
   usage?: OpenAIClient.Completions.CompletionUsage
@@ -210,6 +808,38 @@ function createUsageMetadata(
   }
 
   return usageMetadata;
+}
+
+function createResponsesUsageMetadata(
+  usage?: OpenAIClient.Responses.ResponseUsage
+): UsageMetadata {
+  const usageWithCacheWrite = usage as ResponsesUsageWithCacheWrite | undefined;
+  const inputDetails: UsageMetadata['input_token_details'] = {
+    ...(usage?.input_tokens_details.cached_tokens != null && {
+      cache_read: usage.input_tokens_details.cached_tokens,
+    }),
+    ...(usageWithCacheWrite?.input_tokens_details.cache_write_tokens !=
+      null && {
+      cache_creation:
+        usageWithCacheWrite.input_tokens_details.cache_write_tokens,
+    }),
+  };
+  const outputDetails: UsageMetadata['output_token_details'] = {
+    ...(usage?.output_tokens_details.reasoning_tokens != null && {
+      reasoning: usage.output_tokens_details.reasoning_tokens,
+    }),
+  };
+  return {
+    input_tokens: usage?.input_tokens ?? 0,
+    output_tokens: usage?.output_tokens ?? 0,
+    total_tokens: usage?.total_tokens ?? 0,
+    ...(Object.keys(inputDetails).length > 0 && {
+      input_token_details: inputDetails,
+    }),
+    ...(Object.keys(outputDetails).length > 0 && {
+      output_token_details: outputDetails,
+    }),
+  };
 }
 
 function getExposedOpenAIClient(
@@ -752,6 +1382,8 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
   private convertReasoningDetailsToContent?: boolean;
+  private promptCacheExplicit?: boolean;
+  private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
@@ -759,6 +1391,18 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     this.includeReasoningDetails = fields?.includeReasoningDetails;
     this.convertReasoningDetailsToContent =
       fields?.convertReasoningDetailsToContent;
+    this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.safetyIdentifier = fields?.safety_identifier;
+  }
+
+  invocationParams(
+    options?: this['ParsedCallOptions'],
+    extra?: { streaming?: boolean }
+  ): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
+    return applyManagedRequestParams(super.invocationParams(options, extra), {
+      promptCacheExplicit: this.promptCacheExplicit,
+      safetyIdentifier: this.safetyIdentifier,
+    });
   }
 
   protected _getReasoningParams(
@@ -788,7 +1432,9 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     requestOptions?: OpenAICoreRequestOptions
   ): Promise<AsyncIterable<OpenAIChatCompletionChunk> | OpenAIChatCompletion> {
     return completionWithFilteredOpenAIStream(
-      request,
+      this.promptCacheExplicit === true
+        ? { ...request, messages: addChatCacheBreakpoints(request.messages) }
+        : request,
       requestOptions,
       super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry
     );
@@ -1152,6 +1798,197 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 }
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
+  private promptCacheExplicit?: boolean;
+  private safetyIdentifier?: string;
+  private nativeProgrammaticToolCalling?: boolean;
+
+  constructor(fields?: LibreChatOpenAIFields) {
+    super(fields);
+    this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.safetyIdentifier = fields?.safety_identifier;
+    this.nativeProgrammaticToolCalling = fields?.nativeProgrammaticToolCalling;
+  }
+
+  invocationParams(
+    options?: this['ParsedCallOptions']
+  ): ReturnType<OriginalChatOpenAIResponses['invocationParams']> {
+    const params = applyManagedRequestParams(super.invocationParams(options), {
+      promptCacheExplicit: this.promptCacheExplicit,
+      safetyIdentifier: this.safetyIdentifier,
+      nativeProgrammaticToolCalling: this.nativeProgrammaticToolCalling,
+    });
+    if (shouldIncludeEncryptedReasoning(this.model, params)) {
+      params.include = [
+        ...new Set([
+          ...(params.include ?? []),
+          'reasoning.encrypted_content' as const,
+        ]),
+      ];
+    }
+    return params;
+  }
+
+  protected _reduceChatOpenAITools(
+    tools: BindToolsInput[],
+    fields: { stream?: boolean; strict?: boolean }
+  ): ResponsesTool[] {
+    return getNativeResponsesTools(
+      tools,
+      super._reduceChatOpenAITools(tools, fields),
+      this.nativeProgrammaticToolCalling === true
+    );
+  }
+
+  async completionWithRetry(
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+  async completionWithRetry(
+    request: OpenAIClient.Responses.ResponseCreateParamsNonStreaming,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<OpenAIClient.Responses.Response>;
+  async completionWithRetry(
+    request: ResponsesRequest,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<ResponsesResult> {
+    const linkedInput =
+      this.nativeProgrammaticToolCalling === true
+        ? addProgrammaticCallerLinkage(request.input)
+        : request.input;
+    const managedRequest = {
+      ...request,
+      input:
+        this.promptCacheExplicit === true
+          ? addResponseCacheBreakpoints(linkedInput)
+          : linkedInput,
+    };
+    const result = await completeResponsesWithNativeContinuation(
+      managedRequest,
+      requestOptions,
+      this.nativeProgrammaticToolCalling === true,
+      (nextRequest, nextOptions) =>
+        super.completionWithRetry(
+          nextRequest as OpenAIClient.Responses.ResponseCreateParamsStreaming,
+          nextOptions
+        )
+    );
+    return isResponsesStream(result)
+      ? result
+      : attachCacheWriteMetadata(result);
+  }
+
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    const useManagedResponsesInput =
+      this.nativeProgrammaticToolCalling === true ||
+      hasResponsesReplayItems(messages);
+    if (
+      useManagedResponsesInput &&
+      this.invocationParams(options).stream !== true
+    ) {
+      const data = await this.completionWithRetry(
+        {
+          input: _convertMessagesToOpenAIResponsesParams(
+            messages,
+            this.model,
+            this.zdrEnabled
+          ),
+          ...this.invocationParams(options),
+          stream: false,
+        },
+        {
+          signal: options.signal,
+          ...options.options,
+        }
+      );
+      const message = _convertOpenAIResponsesMessageToBaseMessage(data);
+      const usageMetadata = createResponsesUsageMetadata(data.usage);
+      if (isAIMessage(message)) {
+        message.usage_metadata = usageMetadata;
+        attachCacheWriteUsage(message);
+      }
+      return {
+        generations: [{ text: data.output_text, message }],
+        llmOutput: {
+          id: data.id,
+          estimatedTokenUsage: usageMetadata,
+        },
+      };
+    }
+
+    const result = await super._generate(messages, options, runManager);
+    for (const generation of result.generations) {
+      attachCacheWriteUsage(generation.message);
+    }
+    return result;
+  }
+
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    if (
+      this.nativeProgrammaticToolCalling === true ||
+      hasResponsesReplayItems(messages)
+    ) {
+      const streamIterable = await this.completionWithRetry(
+        {
+          ...this.invocationParams(options),
+          input: _convertMessagesToOpenAIResponsesParams(
+            messages,
+            this.model,
+            this.zdrEnabled
+          ),
+          stream: true,
+        },
+        options
+      );
+      for await (const data of streamIterable) {
+        if (options.signal?.aborted === true) {
+          return;
+        }
+        const chunk = _convertOpenAIResponsesDeltaToBaseMessageChunk(data);
+        if (chunk == null) {
+          continue;
+        }
+        if (
+          data.type === 'response.completed' ||
+          data.type === 'response.incomplete'
+        ) {
+          if (AIMessageChunk.isInstance(chunk.message)) {
+            chunk.message.usage_metadata = createResponsesUsageMetadata(
+              data.response.usage
+            );
+          }
+        }
+        attachCacheWriteUsage(chunk.message);
+        yield chunk;
+        await runManager?.handleLLMNewToken(
+          chunk.text || '',
+          { prompt: options.promptIndex ?? 0, completion: 0 },
+          undefined,
+          undefined,
+          undefined,
+          { chunk }
+        );
+      }
+      return;
+    }
+
+    for await (const chunk of super._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      attachCacheWriteUsage(chunk.message);
+      yield chunk;
+    }
+  }
+
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
@@ -1166,6 +2003,25 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
 }
 
 class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions {
+  private promptCacheExplicit?: boolean;
+  private safetyIdentifier?: string;
+
+  constructor(fields?: LibreChatAzureOpenAIFields) {
+    super(fields);
+    this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.safetyIdentifier = fields?.safety_identifier;
+  }
+
+  invocationParams(
+    options?: this['ParsedCallOptions'],
+    extra?: { streaming?: boolean }
+  ): ReturnType<OriginalAzureChatOpenAICompletions['invocationParams']> {
+    return applyManagedRequestParams(super.invocationParams(options, extra), {
+      promptCacheExplicit: this.promptCacheExplicit,
+      safetyIdentifier: this.safetyIdentifier,
+    });
+  }
+
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
@@ -1273,7 +2129,9 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     requestOptions?: OpenAICoreRequestOptions
   ): Promise<AsyncIterable<OpenAIChatCompletionChunk> | OpenAIChatCompletion> {
     return completionWithFilteredOpenAIStream(
-      request,
+      this.promptCacheExplicit === true
+        ? { ...request, messages: addChatCacheBreakpoints(request.messages) }
+        : request,
       requestOptions,
       super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry
     );
@@ -1281,6 +2139,197 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 }
 
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
+  private promptCacheExplicit?: boolean;
+  private safetyIdentifier?: string;
+  private nativeProgrammaticToolCalling?: boolean;
+
+  constructor(fields?: LibreChatAzureOpenAIFields) {
+    super(fields);
+    this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.safetyIdentifier = fields?.safety_identifier;
+    this.nativeProgrammaticToolCalling = fields?.nativeProgrammaticToolCalling;
+  }
+
+  invocationParams(
+    options?: this['ParsedCallOptions']
+  ): ReturnType<OriginalAzureChatOpenAIResponses['invocationParams']> {
+    const params = applyManagedRequestParams(super.invocationParams(options), {
+      promptCacheExplicit: this.promptCacheExplicit,
+      safetyIdentifier: this.safetyIdentifier,
+      nativeProgrammaticToolCalling: this.nativeProgrammaticToolCalling,
+    });
+    if (shouldIncludeEncryptedReasoning(this.model, params)) {
+      params.include = [
+        ...new Set([
+          ...(params.include ?? []),
+          'reasoning.encrypted_content' as const,
+        ]),
+      ];
+    }
+    return params;
+  }
+
+  protected _reduceChatOpenAITools(
+    tools: BindToolsInput[],
+    fields: { stream?: boolean; strict?: boolean }
+  ): ResponsesTool[] {
+    return getNativeResponsesTools(
+      tools,
+      super._reduceChatOpenAITools(tools, fields),
+      this.nativeProgrammaticToolCalling === true
+    );
+  }
+
+  async completionWithRetry(
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+  async completionWithRetry(
+    request: OpenAIClient.Responses.ResponseCreateParamsNonStreaming,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<OpenAIClient.Responses.Response>;
+  async completionWithRetry(
+    request: ResponsesRequest,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<ResponsesResult> {
+    const linkedInput =
+      this.nativeProgrammaticToolCalling === true
+        ? addProgrammaticCallerLinkage(request.input)
+        : request.input;
+    const managedRequest = {
+      ...request,
+      input:
+        this.promptCacheExplicit === true
+          ? addResponseCacheBreakpoints(linkedInput)
+          : linkedInput,
+    };
+    const result = await completeResponsesWithNativeContinuation(
+      managedRequest,
+      requestOptions,
+      this.nativeProgrammaticToolCalling === true,
+      (nextRequest, nextOptions) =>
+        super.completionWithRetry(
+          nextRequest as OpenAIClient.Responses.ResponseCreateParamsStreaming,
+          nextOptions
+        )
+    );
+    return isResponsesStream(result)
+      ? result
+      : attachCacheWriteMetadata(result);
+  }
+
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    const useManagedResponsesInput =
+      this.nativeProgrammaticToolCalling === true ||
+      hasResponsesReplayItems(messages);
+    if (
+      useManagedResponsesInput &&
+      this.invocationParams(options).stream !== true
+    ) {
+      const data = await this.completionWithRetry(
+        {
+          input: _convertMessagesToOpenAIResponsesParams(
+            messages,
+            this.model,
+            this.zdrEnabled
+          ),
+          ...this.invocationParams(options),
+          stream: false,
+        },
+        {
+          signal: options.signal,
+          ...options.options,
+        }
+      );
+      const message = _convertOpenAIResponsesMessageToBaseMessage(data);
+      const usageMetadata = createResponsesUsageMetadata(data.usage);
+      if (isAIMessage(message)) {
+        message.usage_metadata = usageMetadata;
+        attachCacheWriteUsage(message);
+      }
+      return {
+        generations: [{ text: data.output_text, message }],
+        llmOutput: {
+          id: data.id,
+          estimatedTokenUsage: usageMetadata,
+        },
+      };
+    }
+
+    const result = await super._generate(messages, options, runManager);
+    for (const generation of result.generations) {
+      attachCacheWriteUsage(generation.message);
+    }
+    return result;
+  }
+
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    if (
+      this.nativeProgrammaticToolCalling === true ||
+      hasResponsesReplayItems(messages)
+    ) {
+      const streamIterable = await this.completionWithRetry(
+        {
+          ...this.invocationParams(options),
+          input: _convertMessagesToOpenAIResponsesParams(
+            messages,
+            this.model,
+            this.zdrEnabled
+          ),
+          stream: true,
+        },
+        options
+      );
+      for await (const data of streamIterable) {
+        if (options.signal?.aborted === true) {
+          return;
+        }
+        const chunk = _convertOpenAIResponsesDeltaToBaseMessageChunk(data);
+        if (chunk == null) {
+          continue;
+        }
+        if (
+          data.type === 'response.completed' ||
+          data.type === 'response.incomplete'
+        ) {
+          if (AIMessageChunk.isInstance(chunk.message)) {
+            chunk.message.usage_metadata = createResponsesUsageMetadata(
+              data.response.usage
+            );
+          }
+        }
+        attachCacheWriteUsage(chunk.message);
+        yield chunk;
+        await runManager?.handleLLMNewToken(
+          chunk.text || '',
+          { prompt: options.promptIndex ?? 0, completion: 0 },
+          undefined,
+          undefined,
+          undefined,
+          { chunk }
+        );
+      }
+      return;
+    }
+
+    for await (const chunk of super._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      attachCacheWriteUsage(chunk.message);
+      yield chunk;
+    }
+  }
+
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
